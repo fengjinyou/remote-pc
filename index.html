@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<title>webrc</title>
+<style>
+  :root { --bar: 46px; }
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; overscroll-behavior: none; }
+  #stage { position: fixed; left: 0; right: 0; top: 0; bottom: var(--bar); display: flex; align-items: center; justify-content: center; }
+  #cv { max-width: 100%; max-height: 100%; touch-action: none; cursor: crosshair; background: #000; }
+  #overlay { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.75); padding: 10px 16px; border-radius: 8px; pointer-events: none; white-space: nowrap; }
+  #overlay:empty { display: none; }
+  #kb { position: fixed; left: 0; bottom: var(--bar); width: 2px; height: 2px; opacity: .01; border: 0; padding: 0; resize: none; outline: none; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; height: var(--bar); box-sizing: border-box; display: flex; align-items: center; gap: 4px; padding: 0 6px; overflow-x: auto; background: #222; white-space: nowrap; scrollbar-width: none; }
+  #bar::-webkit-scrollbar { display: none; }
+  #bar button, #bar select { flex: none; height: 32px; min-width: 36px; padding: 0 8px; border: 0; border-radius: 6px; background: #3a3a3a; color: #eee; font: inherit; }
+  #bar button.on { background: #2f80ed; }
+  #bar [hidden] { display: none; }
+  #st { flex: none; margin-left: auto; padding-left: 8px; font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="cv" width="16" height="9"></canvas><div id="overlay">连接中…</div></div>
+<textarea id="kb" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-label="键盘输入"></textarea>
+<div id="bar">
+  <button data-act="kb" title="弹出键盘">⌨</button>
+  <button data-mod="Control">Ctrl</button><button data-mod="Alt">Alt</button><button data-mod="Shift">Shift</button><button data-mod="Meta">Win</button>
+  <button data-key="Escape">Esc</button><button data-key="Tab">Tab</button><button data-key="Enter">↵</button><button data-key="Backspace">⌫</button><button data-key="Delete">Del</button>
+  <button data-key="ArrowLeft">←</button><button data-key="ArrowUp">↑</button><button data-key="ArrowDown">↓</button><button data-key="ArrowRight">→</button>
+  <select id="codec" title="编码：H.264 流量小、看视频流畅（需要被控端有 ffmpeg）；JPEG 不依赖任何东西">
+    <option value="h264">H.264</option>
+    <option value="jpeg">JPEG</option>
+  </select>
+  <select id="kbps" title="H.264 码率上限（中继出口带宽是硬顶，别超过它）">
+    <option value="1000">1M</option>
+    <option value="2000" selected>2M</option>
+    <option value="3000">3M</option>
+    <option value="5000">5M</option>
+    <option value="8000">8M</option>
+  </select>
+  <select id="q" title="分辨率宽度 / JPEG 质量">
+    <option value="0,75">原始尺寸</option>
+    <option value="1920,70">1920</option>
+    <option value="1600,65">1600</option>
+    <option value="1280,60">1280</option>
+    <option value="960,45">960 省流</option>
+  </select>
+  <select id="fps" title="帧率上限"><option value="30">30fps</option><option value="20">20fps</option><option value="15">15fps</option><option value="12" selected>12fps</option><option value="8">8fps</option><option value="5">5fps</option></select>
+  <select id="mon" hidden title="看哪个屏幕（被控端有多个显示器时才出现；所有观众看同一个）"></select>
+  <button data-act="fs">全屏</button>
+  <span id="st"></span>
+</div>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d', { willReadFrequently: true }), kb = $('kb'), overlay = $('overlay'), st = $('st'), bar = $('bar');
+const token = new URLSearchParams(location.search).get('token') || '';
+const SENT = '\u200b';   // 输入框里常驻一个零宽空格：这样手机软键盘的退格也能被捕获到
+const MODS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'OS']);
+const SPECIAL = new Set([...MODS, 'Enter', 'Backspace', 'Tab', 'Escape', 'Delete', 'Insert', 'Home', 'End', 'PageUp', 'PageDown',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'CapsLock', 'NumLock', 'ScrollLock', 'ContextMenu', 'PrintScreen', 'Pause',
+  'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12']);
+const HAS_H264 = typeof VideoDecoder === 'function';   // WebCodecs：Chrome/Edge 94+、Safari 16.4+、Firefox 130+，且要 https 或 localhost
+
+let ws = null, agentOnline = false, synced = false, cur = null, codecName = '';
+const stats = { frames: 0, bytes: 0, strips: 0, t: performance.now(), rtt: null };
+const pressed = new Set();   // 通过 key 事件按下、还没松开的键
+const mods = new Set();      // 工具栏点亮的一次性修饰键（下一个动作用完自动松开）
+
+const send = obj => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); };
+const setOverlay = text => { overlay.textContent = text; };
+
+// 手机默认 1280，电脑默认 1920；之后可随时改
+$('q').value = innerWidth < 900 ? '1280,60' : '1920,70';
+if (!HAS_H264) { $('codec').value = 'jpeg'; $('codec').querySelector('[value=h264]').disabled = true; }
+$('kbps').hidden = $('codec').value !== 'h264';
+
+// ---------- 连接 ----------
+let chain = Promise.resolve();   // 帧必须按顺序画（增量帧叠在前一帧上），所以串成一条链
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { synced = false; setOverlay(agentOnline ? '等待画面…' : '等待被控端上线…'); sendConfig(); };
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') { onText(JSON.parse(e.data)); return; }
+    chain = chain.then(() => drawFrame(e.data)).catch(err => console.warn('frame', err)).then(() => send({ t: 'ack' }));
+  };
+  ws.onclose = () => { setOverlay('连接断开，重连中…'); clearLocal(); synced = false; h264Proven = false; closeDecoder(); setTimeout(connect, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch (_) { /* ignore */ } };
+}
+function onText(m) {
+  if (m.t === 'agent') {
+    agentOnline = !!m.online;
+    setOverlay(agentOnline ? (synced ? '' : '等待画面…') : '被控端离线，等它连上中继…');
+    if (agentOnline) sendConfig();           // 被控端重启后是它自己的默认设置，把页面上选的再发一遍
+    else { synced = false; closeDecoder(); }
+  }
+  else if (m.t === 'cur') { hideCursor(); cur = { x: m.x, y: m.y }; showCursor(); }
+  else if (m.t === 'pong') { stats.rtt = Math.round(performance.now() - m.ts); }
+  else if (m.t === 'mons') setMonitors(m);
+}
+// 以「…」结尾的提示都是过渡状态（等画面、切屏、换解码器），画面一到就清掉
+function clearWaiting() { if (overlay.textContent.endsWith('…')) setOverlay(''); }
+
+// ---------- 屏幕切换：被控端每次有观众进来 / 切完屏都会广播显示器列表 {t:'mons', cur, list:[{i,x,y,w,h,primary}]}，
+// 0 号是所有显示器拼成一张。只有一个显示器时不显示下拉框。所有观众看的是同一个屏，谁切了大家一起换 ----------
+let monSig = '';
+function setMonitors(m) {
+  const sel = $('mon'), list = m.list || [];
+  const sig = list.map(o => `${o.i}:${o.w}x${o.h}`).join(',');
+  if (sig !== monSig) {          // 布局没变就只同步选中项，别在人家正打开下拉框时重建它
+    monSig = sig;
+    sel.innerHTML = '';
+    const screens = list.filter(o => o.i > 0), all = list.find(o => o.i === 0);
+    for (const o of screens) sel.add(new Option(`屏幕${o.i}${o.primary ? '(主)' : ''} ${o.w}×${o.h}`, o.i));
+    if (all && screens.length > 1) sel.add(new Option(`全部屏幕 ${all.w}×${all.h}`, 0));
+    sel.hidden = screens.length < 2;
+  }
+  sel.value = String(m.cur);
+  if (overlay.textContent === '切换屏幕…' && sel.value !== pendingMon) setOverlay('');   // 切失败了（被控端回的还是原来那个）
+}
+let pendingMon = '';
+$('mon').onchange = () => {
+  pendingMon = $('mon').value;
+  send({ t: 'mon', i: Number(pendingMon) });
+  setOverlay('切换屏幕…');
+};
+
+// ---------- 画面：头 <HHhhHH> 宽 高 光标x 光标y flags 条带数；每条 <HHHHI> x y 宽 高 长度 + 数据 ----------
+// flags bit0 = 关键帧，bit1 = 数据是 H.264（此时恒为一条，数据是一个 Annex B 访问单元）；否则每条是一块 JPEG
+async function drawFrame(buf) {
+  const dv = new DataView(buf);
+  const w = dv.getUint16(0, true), h = dv.getUint16(2, true);
+  const cx = dv.getInt16(4, true), cy = dv.getInt16(6, true);
+  const flags = dv.getUint16(8, true), key = (flags & 1) === 1, h264 = (flags & 2) === 2, n = dv.getUint16(10, true);
+  let off = 12;
+  const strips = [];
+  for (let i = 0; i < n; i++) {
+    const x = dv.getUint16(off, true), y = dv.getUint16(off + 2, true), sw = dv.getUint16(off + 4, true), sh = dv.getUint16(off + 6, true);
+    const len = dv.getUint32(off + 8, true);
+    off += 12;
+    strips.push({ x, y, sw, sh, off, len });
+    off += len;
+  }
+  stats.frames++; stats.bytes += buf.byteLength; stats.strips += n;
+  codecName = h264 ? 'H.264' : 'JPEG';
+  if (h264) return drawH264(buf, w, h, cx, cy, key, strips[0]);
+  if (dec) closeDecoder();
+  if (key) synced = true;
+  if (!synced) return;                       // 还没拿到整帧，增量帧没法叠，等（中继已替我们要了关键帧）
+  if (cv.width !== w || cv.height !== h) {
+    if (!key) { send({ t: 'kf' }); return; }
+    resizeCanvas(w, h);
+  }
+  let bmps;
+  try { bmps = await Promise.all(strips.map(s => createImageBitmap(new Blob([new Uint8Array(buf, s.off, s.len)], { type: 'image/jpeg' })))); }
+  catch (_) { send({ t: 'kf' }); return; }
+  hideCursor();
+  strips.forEach((s, i) => { ctx.drawImage(bmps[i], s.x, s.y); bmps[i].close(); });
+  cur = { x: cx, y: cy };
+  showCursor();
+  clearWaiting();
+}
+function resizeCanvas(w, h) { cv.width = w; cv.height = h; cur = null; under = null; }
+
+// ---------- H.264：WebCodecs 硬解。被控端发的是 Annex B（起始码分隔，IDR 前带 SPS/PPS），
+// 这里转成 avcC 格式（4 字节长度前缀 + description 里带 SPS/PPS），所有浏览器都认这种 ----------
+let dec = null, decSig = '', curQueue = [], ts = 0, lastKfReq = 0;
+let h264Proven = false, h264Timer = null, decErrors = 0, h264Mode = 'auto';   // 兜底：硬解不出画面→改软件解码→还不行才切 JPEG（'auto'|'software'）
+function nalUnits(au) {   // 拆成不带起始码的 NAL 数组
+  const out = [];
+  let i = 0, start = -1;
+  const n = au.length;
+  while (i + 2 < n) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1) {
+      if (start >= 0) { let e = i; while (e > start && au[e - 1] === 0) e--; out.push(au.subarray(start, e)); }
+      i += 3; start = i;
+    } else i++;
+  }
+  if (start >= 0) out.push(au.subarray(start, n));
+  return out;
+}
+function paramSets(nals) {
+  const sps = nals.filter(u => (u[0] & 31) === 7), pps = nals.filter(u => (u[0] & 31) === 8);
+  return sps.length && pps.length ? { sps, pps } : null;
+}
+function avcC({ sps, pps }) {
+  const b = new Uint8Array(7 + sps.reduce((a, u) => a + 2 + u.length, 0) + pps.reduce((a, u) => a + 2 + u.length, 0));
+  let o = 0;
+  b[o++] = 1; b[o++] = sps[0][1]; b[o++] = sps[0][2]; b[o++] = sps[0][3]; b[o++] = 0xff; b[o++] = 0xe0 | sps.length;
+  for (const u of sps) { b[o++] = u.length >> 8; b[o++] = u.length & 255; b.set(u, o); o += u.length; }
+  b[o++] = pps.length;
+  for (const u of pps) { b[o++] = u.length >> 8; b[o++] = u.length & 255; b.set(u, o); o += u.length; }
+  return b;
+}
+function toAvcc(nals) {   // 去掉 SPS/PPS/AUD（已经在 description 里），其余加 4 字节大端长度
+  const keep = nals.filter(u => ![7, 8, 9].includes(u[0] & 31));
+  const b = new Uint8Array(keep.reduce((a, u) => a + 4 + u.length, 0));
+  let o = 0;
+  for (const u of keep) { const l = u.length; b[o++] = l >>> 24; b[o++] = (l >> 16) & 255; b[o++] = (l >> 8) & 255; b[o++] = l & 255; b.set(u, o); o += l; }
+  return b;
+}
+function closeDecoder() {
+  if (dec) { try { dec.close(); } catch (_) { /* ignore */ } }
+  dec = null; decSig = ''; curQueue = [];
+  if (h264Timer) { clearTimeout(h264Timer); h264Timer = null; }
+}
+function requestKf() {   // 解不出来就要关键帧，但别刷屏：一秒最多一次
+  const now = performance.now();
+  if (now - lastKfReq < 1000) return;
+  lastKfReq = now; send({ t: 'kf' });
+}
+function armH264Watchdog() {
+  // 有的浏览器/显卡硬解会接受配置和数据、既不报错也不出帧（静默失败）。喂进第一个关键帧后开始计时，
+  // 3 秒还没有任何一帧解出来就先改用软件解码重试，软解也不行才切 JPEG。一旦真的出过帧（h264Proven）就再也不管。
+  if (h264Proven || h264Timer) return;
+  h264Timer = setTimeout(() => {
+    h264Timer = null;
+    if (h264Proven || $('codec').value !== 'h264') return;
+    if (h264Mode === 'auto') { h264Mode = 'software'; retryH264Software(); }
+    else h264Fallback('H.264 解码无输出');
+  }, 3000);
+}
+function retryH264Software() {   // 硬解静默失败，改用软件解码：拆掉旧解码器、要一张新关键帧用软解重建
+  console.warn('h264: hardware decode produced nothing, retrying with software decode');
+  setOverlay('H.264 硬解无输出，改用软件解码…');
+  closeDecoder(); synced = false;
+  requestKf();
+}
+function h264Fallback(msg) {   // 软失败：切 JPEG 但保留 H.264 选项，用户想再试可以再选回来
+  console.warn('h264 fallback:', msg);
+  closeDecoder(); synced = false; h264Proven = false; decErrors = 0; h264Mode = 'auto';
+  setOverlay(msg + '，已自动切到 JPEG');
+  $('codec').value = 'jpeg'; $('kbps').hidden = true;
+  sendConfig();
+}
+function h264Disable(msg) {    // 硬失败（浏览器根本不支持这个 codec）：切 JPEG 并禁掉 H.264 选项
+  console.warn('h264 disabled:', msg);
+  closeDecoder(); synced = false; h264Proven = false;
+  setOverlay(msg + '，已切到 JPEG');
+  $('codec').value = 'jpeg'; $('codec').querySelector('[value=h264]').disabled = true; $('kbps').hidden = true;
+  sendConfig();
+}
+function onDecoded(frame) {
+  h264Proven = true; decErrors = 0;
+  if (h264Timer) { clearTimeout(h264Timer); h264Timer = null; }
+  // 只能拿可见尺寸比，不能拿 codedWidth/Height：H.264 按 16 像素对齐，1080 高的流硬解出来 codedHeight 是 1088（410 → 416），
+  // 拿它比对会把每一帧都当尺寸不符丢掉，表现为一直黑屏/「等待画面…」（软解报的是裁剪后的尺寸，所以只有硬解中招）
+  const r = frame.visibleRect, fw = r ? r.width : frame.displayWidth, fh = r ? r.height : frame.displayHeight;
+  if (fw !== cv.width || fh !== cv.height) { frame.close(); return; }
+  under = null;                              // 整帧盖过去了，光标底下存的那块作废
+  ctx.drawImage(frame, 0, 0);
+  frame.close();
+  const c = curQueue.shift();
+  if (c) cur = c;
+  showCursor();
+  clearWaiting();
+}
+function onDecodeError(e) {
+  console.warn('decoder error', e);
+  closeDecoder(); synced = false;
+  if (++decErrors >= 3) { h264Fallback('H.264 解码反复出错'); return; }   // 别无限要关键帧空转
+  requestKf();
+}
+async function setupDecoder(ps, w, h, sig) {
+  closeDecoder();
+  const hex = v => v.toString(16).padStart(2, '0');
+  const cfg = { codec: `avc1.${hex(ps.sps[0][1])}${hex(ps.sps[0][2])}${hex(ps.sps[0][3])}`, description: avcC(ps), codedWidth: w, codedHeight: h, optimizeForLatency: true };
+  if (h264Mode === 'software') cfg.hardwareAcceleration = 'prefer-software';   // 硬解静默失败后这一档用软解
+  let ok = false;
+  try { ok = (await VideoDecoder.isConfigSupported(cfg)).supported; } catch (_) { /* fall through */ }
+  if (!ok) { h264Disable(`浏览器解不了 ${cfg.codec}`); return; }
+  const d = new VideoDecoder({ output: onDecoded, error: onDecodeError });
+  try { d.configure(cfg); } catch (e) { h264Disable('解码器初始化失败：' + e.message); return; }
+  dec = d; decSig = sig; curQueue = [];
+}
+async function drawH264(buf, w, h, cx, cy, key, s) {
+  if (!HAS_H264) { setOverlay('此浏览器没有 WebCodecs，请切到 JPEG'); return; }
+  const nals = nalUnits(new Uint8Array(buf, s.off, s.len));
+  if (key) {
+    const ps = paramSets(nals);
+    if (!ps) { requestKf(); return; }
+    const sig = [...ps.sps, ...ps.pps].map(u => Array.from(u).join(',')).join('|');
+    if (!dec || dec.state !== 'configured' || sig !== decSig || cv.width !== w || cv.height !== h) {
+      await setupDecoder(ps, w, h, sig);
+      if (!dec) return;
+      resizeCanvas(w, h);
+    }
+    synced = true;
+  }
+  if (!synced || !dec) return;
+  ts += 1000;
+  curQueue.push({ x: cx, y: cy });
+  try { dec.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ts, data: toAvcc(nals) })); }
+  catch (e) { onDecodeError(e); return; }
+  if (key) armH264Watchdog();               // 第一个关键帧下去后开始计时，3 秒不出画面就切 JPEG
+  // 解码队列积压就等它消化，回执因此推迟，被控端会自动放慢
+  while (dec && dec.decodeQueueSize > 2) {
+    await new Promise(r => { const t = setTimeout(r, 100); dec.addEventListener('dequeue', () => { clearTimeout(t); r(); }, { once: true }); });
+  }
+}
+
+// 光标画在画面上，画之前把底下那块存起来，下次先还原再画到新位置，这样不用重画整帧
+let under = null, underPos = null;
+function hideCursor() {
+  if (under) { ctx.putImageData(under, underPos.x, underPos.y); under = null; }
+}
+function showCursor() {
+  if (!cur || cur.x < 0 || cv.width <= 16) return;
+  const s = Math.max(12, cv.width / 100);
+  const px = Math.max(0, cur.x - 2), py = Math.max(0, cur.y - 2);
+  under = ctx.getImageData(px, py, Math.ceil(s * 0.75) + 6, Math.ceil(s * 1.2) + 6);
+  underPos = { x: px, y: py };
+  ctx.save(); ctx.translate(cur.x, cur.y); ctx.scale(s / 16, s / 16);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, 16); ctx.lineTo(4, 12); ctx.lineTo(7, 18); ctx.lineTo(9.5, 17); ctx.lineTo(6.5, 11); ctx.lineTo(11, 11); ctx.closePath();
+  ctx.fillStyle = '#fff'; ctx.strokeStyle = '#000'; ctx.lineWidth = 1.2; ctx.fill(); ctx.stroke(); ctx.restore();
+}
+function sendConfig() {
+  const [width, quality] = $('q').value.split(',').map(Number);
+  send({ t: 'config', width, quality, fps: Number($('fps').value), codec: $('codec').value, kbps: Number($('kbps').value) });
+}
+$('q').onchange = sendConfig;
+$('fps').onchange = sendConfig;
+$('kbps').onchange = sendConfig;
+$('codec').onchange = () => {
+  $('kbps').hidden = $('codec').value !== 'h264';
+  if ($('codec').value === 'h264') { h264Proven = false; decErrors = 0; h264Mode = 'auto'; }   // 重新选回 H.264：从硬解开始重试
+  sendConfig();
+};
+
+// ---------- 坐标 ----------
+function norm(x, y) {
+  const r = cv.getBoundingClientRect();
+  return { x: Math.min(Math.max((x - r.left) / r.width, 0), 1), y: Math.min(Math.max((y - r.top) / r.height, 0), 1) };
+}
+let moveTimer = null, pendingMove = null;
+function queueMove(p) {   // 鼠标移动最多 ~30 次/秒
+  pendingMove = p;
+  if (moveTimer) return;
+  moveTimer = setTimeout(() => { moveTimer = null; flushMove(); }, 30);
+}
+function flushMove() {
+  if (moveTimer) { clearTimeout(moveTimer); moveTimer = null; }
+  if (pendingMove) { send({ t: 'move', ...pendingMove }); pendingMove = null; }
+}
+
+// ---------- 鼠标（电脑端） ----------
+cv.addEventListener('mousemove', e => queueMove(norm(e.clientX, e.clientY)));
+cv.addEventListener('mousedown', e => { e.preventDefault(); focusKb(); syncMods(e); flushMove(); send({ t: 'down', b: e.button, ...norm(e.clientX, e.clientY) }); });
+cv.addEventListener('mouseup', e => { e.preventDefault(); flushMove(); send({ t: 'up', b: e.button, ...norm(e.clientX, e.clientY) }); syncMods(e); releaseMods(); });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const n = d => d === 0 ? 0 : Math.sign(d) * Math.max(1, Math.round(Math.abs(d) / 100));
+  send({ t: 'scroll', dx: n(e.deltaX), dy: -n(e.deltaY) });
+}, { passive: false });
+
+// ---------- 触屏（手机端）：点=左键，长按=右键，长按后拖=左键拖动，单指滑=移动光标，双指滑=滚轮 ----------
+let tch = null, two = null;
+const cancelLP = () => { if (tch && tch.timer) { clearTimeout(tch.timer); tch.timer = null; } };
+cv.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (e.touches.length >= 2) {
+    if (tch) { cancelLP(); if (tch.drag) send({ t: 'up', b: 0 }); tch = null; }
+    two = { y: (e.touches[0].clientY + e.touches[1].clientY) / 2, acc: 0 };
+    return;
+  }
+  const t = e.touches[0];
+  tch = { x: t.clientX, y: t.clientY, moved: false, lp: false, drag: false, timer: null };
+  tch.timer = setTimeout(() => { if (tch && !tch.moved) { tch.lp = true; if (navigator.vibrate) navigator.vibrate(30); } }, 450);
+  queueMove(norm(t.clientX, t.clientY));
+}, { passive: false });
+cv.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (two && e.touches.length >= 2) {
+    const y = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+    two.acc += y - two.y; two.y = y;
+    while (Math.abs(two.acc) >= 30) { const s = Math.sign(two.acc); send({ t: 'scroll', dx: 0, dy: s }); two.acc -= s * 30; }
+    return;
+  }
+  if (!tch) return;
+  const t = e.touches[0];
+  if (!tch.moved) {
+    if (Math.hypot(t.clientX - tch.x, t.clientY - tch.y) < 8) return;
+    tch.moved = true; cancelLP();
+    if (tch.lp) { flushMove(); send({ t: 'down', b: 0, ...norm(tch.x, tch.y) }); tch.drag = true; }
+  }
+  queueMove(norm(t.clientX, t.clientY));
+}, { passive: false });
+cv.addEventListener('touchend', e => {
+  e.preventDefault();
+  if (two) { if (e.touches.length < 2) two = null; return; }
+  if (!tch) return;
+  cancelLP(); flushMove();
+  if (tch.drag) send({ t: 'up', b: 0 });
+  else if (tch.lp) send({ t: 'click', b: 2, ...norm(tch.x, tch.y) });
+  else if (!tch.moved) send({ t: 'click', b: 0, ...norm(tch.x, tch.y) });
+  tch = null; releaseMods();
+}, { passive: false });
+cv.addEventListener('touchcancel', () => { if (tch) { cancelLP(); if (tch.drag) send({ t: 'up', b: 0 }); tch = null; } two = null; });
+
+// ---------- 键盘 ----------
+// 特殊键 / 带 Ctrl、Alt、Win 的组合走 keydown/keyup；普通字符（含中文输入法）走文本框的 input 事件，
+// 这样手机软键盘和桌面输入法都能用。
+function resetKb() { kb.value = SENT; }
+function focusKb() { resetKb(); kb.focus({ preventScroll: true }); }
+const MODKEYS = [['ctrlKey', 'Control'], ['altKey', 'Alt'], ['shiftKey', 'Shift'], ['metaKey', 'Meta']];
+function syncMods(e) {   // 浏览器可能漏掉修饰键本身的 keydown（比如按着 Ctrl 时窗口才拿到焦点），按事件里的状态补齐
+  for (const [prop, k] of MODKEYS) {
+    if (e[prop] && !pressed.has(k) && !mods.has(k)) { send({ t: 'key', k, d: 1 }); pressed.add(k); }
+    else if (!e[prop] && pressed.has(k)) { send({ t: 'key', k, d: 0 }); pressed.delete(k); }
+  }
+}
+kb.addEventListener('keydown', e => {
+  if (e.isComposing || e.key === 'Process' || e.key === 'Unidentified') return;
+  syncMods(e);
+  const special = SPECIAL.has(e.key) || e.key.length > 1;
+  if (!(special || e.ctrlKey || e.altKey || e.metaKey)) return;
+  e.preventDefault();
+  if (e.repeat || pressed.has(e.key)) return;   // 长按自动重复交给被控端的系统去做
+  send({ t: 'key', k: e.key, d: 1 }); pressed.add(e.key);
+});
+kb.addEventListener('keyup', e => {
+  syncMods(e);
+  if (!pressed.has(e.key)) return;
+  e.preventDefault();
+  send({ t: 'key', k: e.key, d: 0 }); pressed.delete(e.key);
+  if (!MODS.has(e.key)) releaseMods();
+});
+kb.addEventListener('input', e => { if (!e.isComposing) flushText(e.inputType || ''); });
+kb.addEventListener('compositionend', () => flushText('composition'));
+function flushText(inputType) {
+  const raw = kb.value;
+  const v = raw.startsWith(SENT) ? raw.slice(SENT.length) : raw;
+  if (raw.length === 0 || (inputType === 'deleteContentBackward' && v === '')) { tapKey('Backspace'); resetKb(); return; }
+  if (v) {
+    const parts = v.split('\n');
+    parts.forEach((p, i) => { if (p) send({ t: 'text', s: p }); if (i < parts.length - 1) tapKey('Enter'); });
+    releaseMods();
+  }
+  resetKb();
+}
+function tapKey(k) { send({ t: 'key', k, d: 1 }); send({ t: 'key', k, d: 0 }); releaseMods(); }
+
+// ---------- 工具栏 ----------
+bar.addEventListener('pointerdown', e => { if (e.target.tagName !== 'SELECT') e.preventDefault(); });  // 别把焦点从输入框抢走
+bar.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.act === 'kb') focusKb();
+  else if (b.dataset.act === 'fs') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  else if (b.dataset.key) tapKey(b.dataset.key);
+  else if (b.dataset.mod) toggleMod(b.dataset.mod, b);
+});
+function toggleMod(k, btn) {
+  if (mods.has(k)) { mods.delete(k); send({ t: 'key', k, d: 0 }); btn.classList.remove('on'); }
+  else { mods.add(k); send({ t: 'key', k, d: 1 }); btn.classList.add('on'); }
+}
+function releaseMods() {
+  for (const k of mods) send({ t: 'key', k, d: 0 });
+  mods.clear();
+  bar.querySelectorAll('button.on').forEach(b => b.classList.remove('on'));
+}
+function clearLocal() { pressed.clear(); mods.clear(); bar.querySelectorAll('button.on').forEach(b => b.classList.remove('on')); }
+function releaseAll() { send({ t: 'release' }); clearLocal(); }
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+// ---------- 状态栏 ----------
+setInterval(() => {
+  const now = performance.now(), dt = (now - stats.t) / 1000;
+  const parts = [`${(stats.frames / dt).toFixed(1)}fps`, `${(stats.bytes / 1024 / dt).toFixed(0)}KB/s`];
+  if (stats.rtt != null) parts.push(`${stats.rtt}ms`);
+  if (cv.width > 16) parts.push(`${cv.width}×${cv.height}`);
+  if (codecName) parts.push(codecName);
+  st.textContent = parts.join(' · ');
+  stats.frames = 0; stats.bytes = 0; stats.strips = 0; stats.t = now;
+}, 2000);
+setInterval(() => send({ t: 'ping', ts: performance.now() }), 2000);
+
+resetKb();
+connect();
+if (!('ontouchstart' in window)) focusKb();   // 电脑上打开就能直接打字；手机上等点键盘按钮再弹
+})();
+</script>
+</body>
+</html>

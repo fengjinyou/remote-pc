@@ -1,0 +1,8 @@
+# Dependencies for agent.py (the controlled Windows PC).
+# The relay only needs aiohttp: pip install aiohttp
+aiohttp
+mss
+numpy
+opencv-python-headless
+pynput
+dxcam    # DXGI Desktop Duplication capture, ~5x faster than mss; optional (falls back to mss)

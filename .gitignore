@@ -1,0 +1,11 @@
+# Per-deployment secrets: the relay's self-signed certificate (private key!) and the token.
+certs/
+relay.token
+
+# Local notes with real IPs / tokens / hostnames.
+private/
+
+__pycache__/
+*.pyc
+*.log
+*.zip
