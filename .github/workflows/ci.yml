@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements-relay.txt
+      - run: python -m unittest discover -s tests -v
+      - run: python -m py_compile agent.py relay.py
+      - name: Check browser script syntax
+        run: >-
+          node -e "const fs=require('node:fs'),vm=require('node:vm');
+          const html=fs.readFileSync('index.html','utf8');
+          const scripts=[...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi)].map(m=>m[1]).filter(s=>s.trim());
+          if(!scripts.length) throw new Error('No inline browser scripts found');
+          scripts.forEach((source,i)=>new vm.Script(source,{filename:'index.html#script-'+(i+1)}));
+          console.log('Parsed '+scripts.length+' browser script(s)');"
+      - name: Check Windows agent dependencies and CLI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt -r requirements-optional.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python agent.py --help

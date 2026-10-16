@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose an improvement to WebRC.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove credentials and personal data from logs/screenshots. Report vulnerabilities privately via SECURITY.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What limitation or workflow does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the behavior, interface, or documentation change.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional.

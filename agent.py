@@ -12,10 +12,12 @@
   jpeg  与上一帧按 64px 分块比对，只把变化的条带编成 JPEG。不依赖 ffmpeg，老浏览器也能看。
 
 用法：
-  python agent.py --relay wss://<公网IP>:33445 --token <串> --cafile relay.crt
+  python agent.py --relay wss://<公网IP>:33445 --token <串> --cafile relay.crt [--name 家里的电脑]
   python agent.py --relay ws://127.0.0.1:18765 --token <串> --dry-run    # 本机联调：只打印输入事件，不真的注入
 
 选项：
+  --name NAME     这台机器在页面「电脑」下拉框里的名字，默认本机 hostname。
+                  一个中继可以同时挂好几台被控电脑，靠这个名字区分；同名的后来者会顶掉前一个
   --monitor N     一开始截哪个显示器：1（默认）、2/3…按系统枚举顺序，0=所有显示器拼成一张。页面工具栏上可随时切
   --codec auto|h264|jpeg   初始编码。auto（默认）= 先发 jpeg，页面要求 h264 时再切（新版页面一连上就会要求）；
                            h264 = 一开始就用 h264；jpeg = 不碰 ffmpeg
@@ -38,6 +40,15 @@
       这里每次有观众进来、以及每次切完，都把显示器列表广播给所有页面：
       {"t":"mons","cur":当前编号,"list":[{"i":编号,"x":左,"y":上,"w":宽,"h":高,"primary":是否主屏},...]}，
       页面据此画下拉框（只有一个显示器时不显示）。中继不认这两个消息，原样转发，所以中继不用升级。
+锁屏：每秒查一次接收输入的桌面。锁屏 / UAC 安全桌面期间截屏线程卡住、一帧都出不来，所以另发
+      {"t":"desk","locked":true/false}（状态变了广播一次，新观众进来时正锁着也补发一次），页面据此说明为什么没画面。
+      同样由中继原样转发；老页面不认，照旧干等。
+管理员窗口：Windows 的 UIPI 规定，前台窗口所属进程的完整性级别比注入者高（任务管理器、「以管理员身份运行」的程序、
+      安装程序……），SendInput / SetCursorPos 一律静默丢弃——画面照常、键鼠全没反应，直到那个窗口失去前台。
+      本进程不是管理员时，每个输入事件注入前先把光标「挪」到它现在的位置探一下（被拒返回 0、错误码 5，成功则什么都不发生）；
+      被拒就查出前台是哪个窗口，发 {"t":"blocked","win":标题,"exe":进程名,"fixed":true/false/null} 给页面说明原因，
+      并在观众点击时请 explorer 把所有窗口最小化（Win+M；普通进程对管理员窗口连 ShowWindow 都是拒绝访问，只有任务栏动得了它），
+      fixed 表示这一招之后输入是不是又能进了（null = 只是移动光标，没有出手）。从管理员终端启动 agent 就完全没这个问题。
 """
 import argparse
 import asyncio
@@ -45,7 +56,9 @@ import ctypes
 import json
 import logging
 import queue
+import re
 import shutil
+import socket
 import ssl
 import struct
 import subprocess
@@ -55,6 +68,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import quote
 
 # 必须在导入 mss/pynput 之前：让本进程按物理像素工作，高 DPI 缩放下截屏尺寸和鼠标坐标才对得上
 try:
@@ -82,7 +96,11 @@ TILE = 64            # jpeg：分块比对的块大小
 FULL_RATIO = 0.5     # jpeg：变化块超过这个比例就直接发整帧（条带太多不如整帧划算）
 MAX_INFLIGHT = 2     # 最多几帧没收到中继回执就暂停截屏
 ACK_TIMEOUT = 10.0   # 中继超过这么久不回执就当它回了（兼容旧中继、防死锁）；必须比中继踢掉卡住观众的 6 秒长
-GOP = 120            # h264：最多隔多少个「有变化的帧」插一个 IDR（画面不动时不喂帧，所以不是按时间算）
+# h264：最多隔多少个「有变化的帧」插一个 IDR（画面不动时不喂帧，所以不是按时间算）。2560x1440 一个 IDR 150–250 KB，
+# 是普通帧的 20–30 倍，中继出口几 Mbps 时每来一个画面就顿半秒；WebSocket 走 TCP 不丢包，用不着靠 IDR 纠错，
+# 新观众要的关键帧另有 kf 请求 / 中继缓存，所以尽量少插（原来 120，30fps 下每 4 秒顿一下）
+GOP = 1800
+RECONNECT_MAX = 5    # 连不上中继时最多隔几秒重试：中继重启、断网恢复后几秒内就能重新上线（原来最多等 30 秒）
 FLAG_KEY, FLAG_H264 = 1, 2
 
 
@@ -94,6 +112,125 @@ def cursor_pos():
     pt = POINT()
     user32.GetCursorPos(ctypes.byref(pt))
     return pt.x, pt.y
+
+
+# 单独一份 user32，好给这几个函数设 64 位句柄的签名，不影响别处（pynput 也在用 user32）
+_desk_u32 = ctypes.WinDLL("user32", use_last_error=True)
+_desk_u32.OpenInputDesktop.restype = ctypes.c_void_p
+_desk_u32.OpenInputDesktop.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+_desk_u32.GetUserObjectInformationW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
+                                                ctypes.POINTER(ctypes.c_uint)]
+_desk_u32.CloseDesktop.argtypes = [ctypes.c_void_p]
+
+
+def input_desktop():
+    """现在接收键鼠输入的桌面叫什么：平时是 Default；锁屏、UAC 确认框、Ctrl+Alt+Del 界面是 Winlogon，
+    普通进程打不开它，这时返回 None。截屏和注入都只对 Default 有效。"""
+    h = _desk_u32.OpenInputDesktop(0, 0, 0x0001)   # DESKTOP_READOBJECTS
+    if not h:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(64)
+        n = ctypes.c_uint()
+        return buf.value if _desk_u32.GetUserObjectInformationW(h, 2, buf, ctypes.sizeof(buf), ctypes.byref(n)) else None  # UOI_NAME
+    finally:
+        _desk_u32.CloseDesktop(h)
+
+
+_desk_u32.GetForegroundWindow.restype = ctypes.c_void_p
+_desk_u32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+_desk_u32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+_desk_u32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+_desk_u32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.OpenProcess.restype = ctypes.c_void_p
+_k32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+_k32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint)]
+_k32.CloseHandle.argtypes = [ctypes.c_void_p]
+_k32.GetCurrentProcess.restype = ctypes.c_void_p
+_adv = ctypes.WinDLL("advapi32", use_last_error=True)
+_adv.OpenProcessToken.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+_adv.GetTokenInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint)]
+_adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+_adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+_adv.GetSidSubAuthority.restype = ctypes.POINTER(ctypes.c_uint)
+_adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+IL_HIGH = 0x3000          # 管理员（UAC 提权后）；普通程序是 0x2000（medium），SYSTEM 是 0x4000
+
+
+def process_il(hproc):
+    """进程令牌的完整性级别（SECURITY_MANDATORY_*_RID），查不到返回 None。普通进程也能查管理员进程的（2026-09-26 实测）。"""
+    tok = ctypes.c_void_p()
+    if not _adv.OpenProcessToken(hproc, 0x0008, ctypes.byref(tok)):        # TOKEN_QUERY
+        return None
+    try:
+        n = ctypes.c_uint()
+        _adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(n))          # TokenIntegrityLevel
+        buf = ctypes.create_string_buffer(n.value)
+        if not _adv.GetTokenInformation(tok, 25, buf, n.value, ctypes.byref(n)):
+            return None
+        sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]           # TOKEN_MANDATORY_LABEL.Label.Sid
+        return _adv.GetSidSubAuthority(sid, _adv.GetSidSubAuthorityCount(sid)[0] - 1)[0]
+    finally:
+        _k32.CloseHandle(tok)
+
+
+def my_il():
+    return process_il(_k32.GetCurrentProcess())
+
+
+def il_name(il):
+    return "?" if il is None else {0x1000: "low", 0x2000: "medium", 0x3000: "high (administrator)", 0x4000: "system"}.get(il & ~0xfff, hex(il))
+
+
+def foreground_info():
+    """前台窗口：标题、所属进程的 exe 名和完整性级别。没有前台窗口（正在切换 / 安全桌面）返回 None。"""
+    hwnd = _desk_u32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = ctypes.c_uint()
+    _desk_u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    title = ctypes.create_unicode_buffer(256)
+    _desk_u32.GetWindowTextW(hwnd, title, 256)
+    exe, il = "?", None
+    h = _k32.OpenProcess(0x1000, 0, pid.value)                                 # PROCESS_QUERY_LIMITED_INFORMATION
+    if h:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = ctypes.c_uint(1024)
+            if _k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                exe = buf.value.rsplit("\\", 1)[-1]
+            il = process_il(h)
+        finally:
+            _k32.CloseHandle(h)
+    return {"hwnd": hwnd, "pid": pid.value, "title": title.value, "exe": exe, "il": il}
+
+
+def inject_allowed():
+    """现在往系统注入键鼠会不会被丢掉：把光标「挪」到它当前的位置——UIPI 拒绝时 SetCursorPos 返回 0（错误码 5），
+    允许时什么都不发生。前台窗口所属进程的完整性级别比本进程高就会被拒；本进程是管理员时几乎不会。"""
+    pt = POINT()
+    if not _desk_u32.GetCursorPos(ctypes.byref(pt)):
+        return True          # 查不到光标（桌面切走了）：另有 desk 消息说明，这里不算被拒
+    return bool(_desk_u32.SetCursorPos(pt.x, pt.y))
+
+
+def shell_minimize_all():
+    """请 explorer 把所有窗口最小化（相当于 Win+M）：管理员窗口只有任务栏（explorer）动得了，普通权限的进程对它调
+    ShowWindow / ShowWindowAsync / SetWindowPos 全是拒绝访问（2026-09-26 实测）。走 PowerShell 调 Shell.Application 的 COM，
+    不用装 pywin32。explorer 收拾窗口是异步的，稍等一下再让调用方重新探测。"""
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            "(New-Object -ComObject Shell.Application).MinimizeAll()"],
+                           capture_output=True, timeout=10, creationflags=0x08000000)   # CREATE_NO_WINDOW
+        if r.returncode != 0:
+            log.warning("MinimizeAll via explorer failed: %s", r.stderr.decode(errors="replace").strip()[:300])
+            return False
+        time.sleep(0.4)
+        return True
+    except Exception as e:
+        log.warning("MinimizeAll via explorer failed: %s", e)
+        return False
 
 
 def list_monitors():
@@ -632,6 +769,8 @@ BUTTONS = {0: Button.left, 1: Button.middle, 2: Button.right}
 class Input:
     """把浏览器发来的事件注入本机。坐标是 0..1 的比例，换算到当前所截显示器的物理像素（切了屏就跟着切）。"""
 
+    INJECTED = ("move", "down", "up", "click", "scroll", "key", "text")   # 会真往系统里注入的事件（release 只松自己按过的）
+
     def __init__(self, grabber, dry_run):
         self.grabber = grabber
         self.dry = dry_run
@@ -639,6 +778,12 @@ class Input:
         self.kb = Keyboard()
         self.held_keys = set()
         self.held_buttons = set()
+        il = my_il()
+        self.elevated = il is not None and il >= IL_HIGH   # 管理员进程注入不会被 UIPI 拒，省掉每个事件前的探测
+        self.blocked_hwnd = None       # 上次挡住注入的前台窗口，同一个窗口不反复记日志
+        self.blocked_at = 0.0
+        self.last_report = 0.0         # 上次告诉页面「被挡住了」的时刻（鼠标移动 30 次/秒，不能每次都发）
+        self.last_rescue = 0.0         # 上次请 explorer 最小化窗口的时刻
 
     def _pos(self, ev):
         mon = self.grabber.monitor
@@ -656,10 +801,14 @@ class Input:
         return None
 
     def handle(self, ev):
+        """注入一个事件。正常返回 None；注入会被系统丢掉（前台是权限更高的窗口）时丢弃这个事件，
+        返回一个 dict 让 Agent 去告诉页面、必要时自救——就算马上救回来，这一下点的也已经不是用户看到的那个位置了。"""
         t = ev.get("t")
         if self.dry:
             log.info("dry-run %s", json.dumps(ev, ensure_ascii=False))
-            return
+            return None
+        if t in self.INJECTED and not self.elevated and not inject_allowed():
+            return self._blocked(t)
         try:
             if t == "move":
                 self.mouse.position = self._pos(ev)
@@ -695,6 +844,26 @@ class Input:
                 self.release_all()
         except Exception as e:  # pynput 对个别按键可能抛异常，别让它把连接搞断
             log.warning("input %s failed: %s", t, e)
+        return None
+
+    def _blocked(self, t):
+        """注入被拒：查前台是谁，换了窗口就记一次日志；返回给页面的说明（限频），点击时顺带请求自救。"""
+        if (input_desktop() or "").lower() != "default":
+            return None                                   # 锁屏 / UAC 安全桌面：desk 消息已经在说明了，不重复
+        now = time.monotonic()
+        fg = foreground_info() or {}
+        if fg.get("hwnd") != self.blocked_hwnd or now - self.blocked_at > 60:
+            self.blocked_hwnd, self.blocked_at = fg.get("hwnd"), now
+            log.warning("input dropped by Windows (UIPI): foreground window %r is %s at %s, this agent is %s "
+                        "-- start agent.py from an administrator terminal to control such windows",
+                        fg.get("title", "?"), fg.get("exe", "?"), il_name(fg.get("il")), il_name(my_il()))
+        rescue = t in ("down", "click") and now - self.last_rescue > 5
+        if rescue:
+            self.last_rescue = now
+        elif now - self.last_report < 2:
+            return None
+        self.last_report = now
+        return {"win": fg.get("title", ""), "exe": fg.get("exe", "?"), "rescue": rescue}
 
     def release_all(self):
         for k in list(self.held_keys):
@@ -723,6 +892,9 @@ class Agent:
         self.viewers = 0
         self.inflight = deque()   # 已发出、中继还没回执的帧的发送时刻
         self._ack_warned = False
+        self.last_input = 0.0     # 最近一次收到观众键鼠输入的时刻：刚操作过就别放慢截屏
+        self.kick = None          # asyncio.Event，有输入时叫醒慢速等待中的截屏循环（在 run() 里建）
+        self.locked = None        # 输入桌面是不是 Default 以外（锁屏 / UAC）；None = 这次连接还没查过
 
     def _ssl(self):
         if not self.args.relay.lower().startswith("wss"):
@@ -737,36 +909,47 @@ class Agent:
         return True  # 系统 CA；自签证书要么给 --cafile，要么 --insecure
 
     async def run(self):
-        url = self.args.relay.rstrip("/") + "/agent?token=" + self.args.token
+        url = (self.args.relay.rstrip("/") + "/agent?token=" + quote(self.args.token, safe="")
+               + "&name=" + quote(self.args.name, safe=""))
         ssl_ctx = self._ssl()
+        self.kick = asyncio.Event()
         backoff = 1
+        fails = 0
         try:
             while True:
                 try:
                     async with aiohttp.ClientSession() as sess:
                         async with sess.ws_connect(url, ssl=ssl_ctx, heartbeat=20, max_msg_size=1 << 20) as ws:
-                            log.info("connected: %s", self.args.relay)
+                            log.info("connected: %s as [%s]%s", self.args.relay, self.args.name,
+                                     f" after {fails} failed attempts" if fails > 3 else "")
                             backoff = 1
+                            fails = 0
                             self.inflight.clear()
                             self._ack_warned = False
                             self.grabber.force = True
+                            self.locked = None
                             await self._session(ws)
                     log.warning("relay closed the connection")
                 except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as e:
-                    log.warning("connect failed: %s", e)
+                    fails += 1
+                    # 中继长时间连不上时每 5 秒失败一次，别刷满日志：前 3 次照记，之后每 60 次（约 5 分钟）记一次
+                    if fails <= 3 or fails % 60 == 0:
+                        log.warning("connect failed (%d): %s", fails, e)
                 except Exception:
                     log.exception("session error")
                 finally:
                     self.viewers = 0
                     self.input.release_all()
-                log.info("retry in %ds", backoff)
+                if fails <= 3:
+                    log.info("retry in %ds", backoff)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, RECONNECT_MAX)
         finally:
             await self.grabber.close()
 
     async def _session(self, ws):
-        tasks = {asyncio.create_task(self._reader(ws)), asyncio.create_task(self._sender(ws))}
+        tasks = {asyncio.create_task(self._reader(ws)), asyncio.create_task(self._sender(ws)),
+                 asyncio.create_task(self._desk_watch(ws))}
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
@@ -801,6 +984,8 @@ class Agent:
                     self.input.release_all()
                 else:
                     asyncio.create_task(self._send_monitors(ws, refresh=True))   # 新观众要显示器列表画下拉框
+                    if self.locked:
+                        asyncio.create_task(self._send_desk(ws))                  # 进来时正锁着屏，告诉他为什么没画面
             elif t == "mon":
                 asyncio.create_task(self._switch_monitor(ws, ev))
             elif t == "config":
@@ -811,7 +996,47 @@ class Agent:
                     self.grabber.force = True
                     log.info("config: codec=%s width=%d quality=%d fps=%d kbps=%d", s.codec, s.width, s.quality, s.fps, s.kbps)
             else:
-                self.input.handle(ev)
+                blocked = self.input.handle(ev)
+                if blocked:
+                    asyncio.create_task(self._report_blocked(ws, blocked))
+                self.last_input = time.monotonic()
+                self.kick.set()
+
+    async def _report_blocked(self, ws, info):
+        """注入被 UIPI 拒了：要自救就先请 explorer 把窗口都最小化（PowerShell 起一下要几百毫秒，放线程里跑），
+        再探一次告诉页面成没成；只是移动光标就直接说明原因。"""
+        fixed = None
+        if info.pop("rescue"):
+            ok = await asyncio.get_running_loop().run_in_executor(None, shell_minimize_all)
+            fixed = bool(ok and inject_allowed())
+            log.info("rescue: MinimizeAll via explorer %s, input %s", "done" if ok else "failed",
+                     "allowed again" if fixed else "still blocked")
+        try:
+            await ws.send_str(json.dumps({"t": "blocked", **info, "fixed": fixed}, ensure_ascii=False))
+        except Exception as e:
+            log.debug("send blocked failed: %s", e)
+
+    async def _desk_watch(self, ws):
+        """每秒看一眼输入桌面。锁屏 / UAC 期间截屏线程卡在 dxcam 的内部重试里，一帧都出不来，页面只能干等
+        「等待画面…」，看的人不知道为什么（日志里有过一分钟连刷 5 次页面的）——所以单独告诉页面一声。"""
+        while True:
+            try:
+                locked = (input_desktop() or "").lower() != "default"
+            except Exception as e:      # 查不了就当没锁，别因为这个把连接搞断
+                log.debug("input desktop check failed: %s", e)
+                locked = False
+            if locked != self.locked:
+                if self.locked is not None or locked:
+                    log.info("input desktop: %s", "locked / secure desktop" if locked else "Default")
+                self.locked = locked
+                await self._send_desk(ws)
+            await asyncio.sleep(1)
+
+    async def _send_desk(self, ws):
+        try:
+            await ws.send_str(json.dumps({"t": "desk", "locked": bool(self.locked)}))
+        except Exception as e:
+            log.debug("send desk failed: %s", e)
 
     def _monitors_msg(self):
         g = self.grabber
@@ -894,19 +1119,90 @@ class Agent:
                 sent = nbytes = grabs = strips = keys = 0
                 grab_ms = 0.0
                 t_stat = now
-            # 画面长时间没变就放慢轮询，省 CPU；一有变化立刻恢复满帧率
-            period = 1.0 / s.fps if idle < s.fps * 2 else 0.2
-            await asyncio.sleep(max(0.0, period - (now - t0)))
+            # 画面 2 秒没变就放慢到 5 次/秒轮询，省 CPU；一有变化立刻恢复满帧率。但刚收到过键鼠输入时不放慢，
+            # 慢速等待中来了输入也立刻醒：否则看了一会儿再点，第一帧反应要多等最多 200 ms，光标也只剩 5 fps
+            slow = idle >= s.fps * 2 and now - self.last_input > 2.0
+            delay = (0.2 if slow else 1.0 / s.fps) - (now - t0)
+            if delay <= 0:
+                continue
+            if not slow:
+                await asyncio.sleep(delay)
+                continue
+            self.kick.clear()
+            try:
+                await asyncio.wait_for(self.kick.wait(), delay)
+            except asyncio.TimeoutError:
+                pass
 
 
-def setup_logging(path):
-    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+def disable_quick_edit():
+    """关掉本进程控制台的「快速编辑」：在窗口里点一下（远程点到也算）就不会进入选择状态。选择状态下往控制台写东西的线程
+    会一直卡住——2026-09-24 就这么冻过：远程点到了 agent 自己的控制台，标题变成「选择 …」，agent 下一次写日志就卡死，
+    不收消息、不回心跳、不重连，页面上只剩中继缓存的旧画面、怎么点都没反应。没有控制台（pythonw）时什么都不做。"""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GetStdHandle.restype = ctypes.c_void_p
+    k32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+    k32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    h = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+    mode = ctypes.c_uint()
+    if h and k32.GetConsoleMode(h, ctypes.byref(mode)):
+        k32.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)   # 去掉 ENABLE_QUICK_EDIT_MODE，带上 ENABLE_EXTENDED_FLAGS 才生效
+
+
+class ConsoleHandler(logging.Handler):
+    """日志写控制台放到后台线程：控制台不管因为什么写不动（被选中、被暂停），卡住的只是这个线程，主循环照常跑；
+    积压太多就丢，文件日志不受影响。"""
+
+    def __init__(self, stream):
+        super().__init__()
+        self.stream = stream
+        self.q = queue.Queue(maxsize=2000)
+        threading.Thread(target=self._drain, daemon=True, name="console-log").start()
+
+    def emit(self, record):
+        try:
+            self.q.put_nowait(self.format(record))
+        except queue.Full:
+            pass
+        except Exception:
+            self.handleError(record)
+
+    def _drain(self):
+        while True:
+            line = self.q.get()
+            try:
+                self.stream.write(line + "\n")
+                self.stream.flush()
+            except Exception:
+                pass
+
+
+class TokenRedactingFormatter(logging.Formatter):
+    """Keep authenticated URLs out of logs, including exception tracebacks."""
+
+    def __init__(self, token):
+        super().__init__("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+        self.redactions = sorted({token, quote(token, safe="")}, key=len, reverse=True)
+
+    def format(self, record):
+        text = super().format(record)
+        # aiohttp/yarl may normalize the URL's percent encoding in exceptions.
+        text = re.sub(r"([?&]token=)[^&#\s'\"<>]*", r"\1[redacted]", text, flags=re.IGNORECASE)
+        for value in self.redactions:
+            if value:
+                text = text.replace(value, "[redacted]")
+        return text
+
+
+def setup_logging(path, token=""):
+    fmt = TokenRedactingFormatter(token)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     if sys.stderr is not None:
         if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(errors="replace")
-        h = logging.StreamHandler(sys.stderr)
+        disable_quick_edit()
+        h = ConsoleHandler(sys.stderr)
         h.setFormatter(fmt)
         root.addHandler(h)
     if path or sys.stderr is None:
@@ -921,6 +1217,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--relay", required=True, help="ws://host:port 或 wss://host:port")
     ap.add_argument("--token", required=True, help="和 relay 一样的口令")
+    ap.add_argument("--name", default=socket.gethostname(),
+                    help="这台机器在页面上的名字（默认本机 hostname），一个中继挂多台时靠它区分")
     ap.add_argument("--cafile", help="relay 的自签证书 relay.crt（wss 时用它校验）")
     ap.add_argument("--insecure", action="store_true", help="wss 不校验证书（不推荐）")
     ap.add_argument("--monitor", type=int, default=1, help="一开始截哪个显示器（1、2…；0 = 全部拼一张），页面上可随时切")
@@ -935,9 +1233,17 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="只打印收到的输入事件，不注入")
     ap.add_argument("--log", help="日志文件路径")
     args = ap.parse_args()
-    setup_logging(args.log)
+    args.name = "".join(c for c in (args.name or "").strip() if ord(c) >= 32 and c != "\x7f")[:32] or "unnamed"
+    setup_logging(args.log, args.token)
     if args.dry_run:
         log.info("DRY RUN: input events are logged, not injected")
+    il = my_il()
+    if il is not None and il < IL_HIGH:
+        log.warning("not running as administrator (%s): whenever an elevated window (Task Manager, an app run as administrator, "
+                    "an installer) is in the foreground, Windows drops this agent's mouse/keyboard input -- "
+                    "start from an administrator terminal to avoid that", il_name(il))
+    else:
+        log.info("running as %s", il_name(il))
     try:
         ctypes.windll.winmm.timeBeginPeriod(1)   # 系统定时器默认 15.6 ms 一格，asyncio.sleep(72ms) 会睡成 78–94 ms，12fps 只剩 10.7
     except Exception:

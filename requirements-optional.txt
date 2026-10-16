@@ -1,0 +1,2 @@
+# Optional Windows DXGI capture. The agent falls back to mss without it.
+dxcam>=0.3,<0.4; sys_platform == "win32"

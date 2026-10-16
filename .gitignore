@@ -8,4 +8,22 @@ private/
 __pycache__/
 *.pyc
 *.log
+*.log.*
 *.zip
+
+# Local Python environments, build output, and deployment staging.
+.venv/
+.venv-*/
+venv/
+dist/
+build/
+deploy/
+/webrc/
+.pytest_cache/
+
+# Local credentials and environment overrides.
+.env
+.env.*
+!.env.example
+*.key
+*.token

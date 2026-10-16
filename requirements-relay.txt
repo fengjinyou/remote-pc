@@ -1,0 +1,2 @@
+# The relay runs on Windows, Linux, and macOS with Python 3.11+.
+aiohttp>=3.13.2,<4
